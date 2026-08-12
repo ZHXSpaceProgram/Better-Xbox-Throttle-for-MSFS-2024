@@ -597,23 +597,15 @@ def main():
 
             now = time.perf_counter()
 
-            a_button.update(
-                gamepad,
-                now
-            )
+            a_button.update(gamepad, now)
 
-            b_button.update(
-                gamepad,
-                now
-            )
+            b_button.update(gamepad, now)
 
             # ------------------------------------------------
             # 根据 POLL_HZ 设置扫描间隔
             # ------------------------------------------------
 
-            time.sleep(
-                1.0 / POLL_HZ
-            )
+            time.sleep(1.0 / POLL_HZ)
 
     except KeyboardInterrupt:
         print("\n程序退出。")
