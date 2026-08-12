@@ -4,6 +4,7 @@
 
 ## 使用方法
 
+- 从[这里](https://github.com/ZHXSpaceProgram/Better-Xbox-Throttle-for-MSFS-2024/releases)下载最新版本。
 - 先打开MSFS 2024，然后运行程序。
 - 可以通过配置文件 `config.ini` 调整控制参数。
 
