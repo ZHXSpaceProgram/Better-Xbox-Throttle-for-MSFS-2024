@@ -557,15 +557,14 @@ class XBrakeController:
     def _send_brake(self, force=False):
         axis_value = brake_percent_to_axis(self.brake_percent)
 
-        if (not force) and axis_value == self.last_axis_value:
+        if not force and axis_value == self.last_axis_value:
             return
 
-        # Python-SimConnect 的 Event(value) 会把参数作为 DWORD 发送。
-        # 负的轴值按 32 位二进制补码传递。
         event_value = axis_value & 0xFFFFFFFF
 
         self.left_event(event_value)
         self.right_event(event_value)
+
         self.last_axis_value = axis_value
 
 
