@@ -20,6 +20,21 @@ HOLD_DELAY = 0.28
 ENABLE_LB_FINE_THROTTLE = True
 FINE_TAP_COUNT = 2
 
+# ============================================================
+# X 键渐进刹车参数（直接在这里调整）
+#
+# 所有“强度/速度”均按百分比理解：
+#   0.0   = 0%
+#   100.0 = 100%
+# ============================================================
+
+ENABLE_X_BRAKE = True
+X_BRAKE_TAP_INCREASE = 12.0            # 轻按一次增加多少 %
+X_BRAKE_HOLD_INCREASE_PER_SEC = 0.0   # 长按时每秒增加多少 %
+X_BRAKE_DECAY_DELAY = 0.20             # 松开后等待多久才开始衰减（秒）
+X_BRAKE_DECAY_PER_SEC = 100.0           # 衰减时每秒降低多少 %
+_X_BRAKE_HOLD_DELAY = 0.28             # 长按判定时间
+
 
 def load_config():
     global GAMEPAD_INDEX, POLL_HZ, TAP_COUNT, HOLD_SEND_HZ, HOLD_DELAY, ENABLE_LB_FINE_THROTTLE, FINE_TAP_COUNT
@@ -28,17 +43,30 @@ def load_config():
         config_path = Path(sys.executable).with_name("config.ini")
     else:
         config_path = Path(__file__).with_name("config.ini")
-    config.read(
-        config_path,
-        encoding="utf-8"
-    )
-    GAMEPAD_INDEX = config.getint("gamepad", "index")
+    config.read(config_path, encoding="utf-8")
+    GAMEPAD_INDEX = config.getint("gamepad", "index", fallback=GAMEPAD_INDEX)
     POLL_HZ = config.getfloat("gamepad", "poll_hz")
     TAP_COUNT = config.getint("throttle", "tap_count")
     HOLD_SEND_HZ = config.getfloat("throttle", "hold_send_hz")
     HOLD_DELAY = config.getfloat("throttle", "hold_delay")
     ENABLE_LB_FINE_THROTTLE = config.getboolean("fine_throttle", "enabled")
     FINE_TAP_COUNT = config.getint("fine_throttle", "fine_tap_count")
+
+    global ENABLE_X_BRAKE, X_BRAKE_TAP_INCREASE, X_BRAKE_HOLD_INCREASE_PER_SEC, X_BRAKE_DECAY_DELAY, X_BRAKE_DECAY_PER_SEC
+    
+    ENABLE_X_BRAKE = config.getboolean("brake", "enabled", fallback=ENABLE_X_BRAKE)
+    X_BRAKE_TAP_INCREASE = config.getfloat("brake", "tap_increase", fallback=X_BRAKE_TAP_INCREASE)
+    X_BRAKE_HOLD_INCREASE_PER_SEC = config.getfloat(
+        "brake",
+        "hold_increase_per_sec",
+        fallback=X_BRAKE_HOLD_INCREASE_PER_SEC
+    )
+    X_BRAKE_DECAY_DELAY = config.getfloat(
+        "brake", "decay_delay", fallback=X_BRAKE_DECAY_DELAY
+    )
+    X_BRAKE_DECAY_PER_SEC = config.getfloat(
+        "brake", "decay_per_sec", fallback=X_BRAKE_DECAY_PER_SEC
+    )
 
 
 # ============================================================
@@ -461,6 +489,209 @@ class ThrottleButton:
 
 
 # ============================================================
+# X 键渐进刹车状态机
+# ============================================================
+
+def brake_percent_to_axis(brake_percent):
+    """
+    把 0~100% 的目标刹车强度转换为 AXIS_*_BRAKE_SET 的输入值。
+
+    MSFS 2024 的 AXIS_LEFT_BRAKE_SET / AXIS_RIGHT_BRAKE_SET
+    使用 -16383 ~ +16383，并且官方给出的响应是非线性的。
+    这里依据官方公布的几个标定点做分段线性反算，让上面的
+    “百分比参数”更接近实际刹车百分比，而不是直接操作原始轴值。
+    """
+
+    p = max(0.0, min(100.0, float(brake_percent)))
+
+    calibration = (
+        (0.0, -16383),
+        (8.0, -8191),
+        (27.0, 0),
+        (53.0, 8191),
+        (100.0, 16383),
+    )
+
+    for i in range(1, len(calibration)):
+        p0, axis0 = calibration[i - 1]
+        p1, axis1 = calibration[i]
+
+        if p <= p1:
+            ratio = (p - p0) / (p1 - p0)
+            return int(round(axis0 + (axis1 - axis0) * ratio))
+
+    return 16383
+
+
+class XBrakeController:
+    """
+    X 键控制左右轮刹车。
+
+    行为：
+      1. 刚按下 X：立即增加 X_BRAKE_TAP_INCREASE。
+      2. 按住超过 _X_BRAKE_HOLD_DELAY：按
+         X_BRAKE_HOLD_INCREASE_PER_SEC 连续增加。
+      3. 松开 X：保持当前刹车 X_BRAKE_DECAY_DELAY 秒。
+      4. 延迟结束后：按 X_BRAKE_DECAY_PER_SEC 连续衰减到 0。
+
+    只有 X 功能真正使用过以后才会发送刹车轴事件；衰减到 0 后
+    停止继续发送，从而尽量减少对其它刹车输入设备的持续覆盖。
+    """
+
+    def __init__(self, left_event, right_event):
+        self.left_event = left_event
+        self.right_event = right_event
+
+        self.brake_percent = 0.0
+        self.prev_down = False
+
+        self.press_time = 0.0
+        self.hold_started = False
+
+        self.decay_start_time = None
+        self.last_update_time = None
+
+        self.last_axis_value = None
+
+
+    def _send_brake(self, force=False):
+        axis_value = brake_percent_to_axis(self.brake_percent)
+
+        if (not force) and axis_value == self.last_axis_value:
+            return
+
+        # Python-SimConnect 的 Event(value) 会把参数作为 DWORD 发送。
+        # 负的轴值按 32 位二进制补码传递。
+        event_value = axis_value & 0xFFFFFFFF
+
+        self.left_event(event_value)
+        self.right_event(event_value)
+        self.last_axis_value = axis_value
+
+
+    def _set_brake_percent(self, value):
+        value = max(0.0, min(100.0, float(value)))
+
+        if abs(value - self.brake_percent) < 1e-9:
+            return
+
+        self.brake_percent = value
+        self._send_brake()
+
+
+    def release_immediately(self):
+        """立即把本功能施加的刹车释放到 0%。"""
+
+        had_control = (
+            self.last_axis_value is not None
+            or self.brake_percent > 0.0
+        )
+
+        self.brake_percent = 0.0
+        self.prev_down = False
+        self.press_time = 0.0
+        self.hold_started = False
+        self.decay_start_time = None
+        self.last_update_time = None
+
+        if had_control:
+            self._send_brake(force=True)
+
+        # 发送一次 0% 后立即放弃“所有权”。
+        # 这样断开期间不会每 0.25 秒持续覆盖其它刹车输入。
+        self.last_axis_value = None
+
+
+    def update(self, gamepad, now):
+        if not ENABLE_X_BRAKE:
+            return
+
+        down = bool(gamepad.wButtons & XINPUT_GAMEPAD_X)
+
+        # ----------------------------------------------------
+        # 1. 新按下：立即按“轻按增加量”增加一次
+        # ----------------------------------------------------
+
+        if down and not self.prev_down:
+            self.press_time = now
+            self.hold_started = False
+            self.decay_start_time = None
+            self.last_update_time = now
+
+            self._set_brake_percent(
+                self.brake_percent
+                + max(0.0, float(X_BRAKE_TAP_INCREASE))
+            )
+
+        # ----------------------------------------------------
+        # 2. 按住：超过长按判定后按“每秒增加量”连续增加
+        # ----------------------------------------------------
+
+        if down:
+            held = now - self.press_time
+
+            if held >= _X_BRAKE_HOLD_DELAY:
+                if not self.hold_started:
+                    self.hold_started = True
+                    self.last_update_time = now
+
+                else:
+                    dt = max(0.0, now - self.last_update_time)
+                    self.last_update_time = now
+
+                    if dt > 0.0:
+                        self._set_brake_percent(
+                            self.brake_percent
+                            + max(0.0, float(X_BRAKE_HOLD_INCREASE_PER_SEC)) * dt
+                        )
+
+            else:
+                self.last_update_time = now
+
+        # ----------------------------------------------------
+        # 3. 刚松开：记录衰减开始时间
+        # ----------------------------------------------------
+
+        if (not down) and self.prev_down:
+            self.hold_started = False
+            self.decay_start_time = (
+                now + max(0.0, float(X_BRAKE_DECAY_DELAY))
+            )
+            self.last_update_time = now
+
+        # ----------------------------------------------------
+        # 4. 松开后：延迟结束再连续衰减
+        # ----------------------------------------------------
+
+        if (
+            not down
+            and self.brake_percent > 0.0
+            and self.decay_start_time is not None
+            and now >= self.decay_start_time
+        ):
+            decay_from = max(
+                self.last_update_time,
+                self.decay_start_time
+            )
+            dt = max(0.0, now - decay_from)
+            self.last_update_time = now
+
+            if dt > 0.0:
+                self._set_brake_percent(
+                    self.brake_percent
+                    - max(0.0, float(X_BRAKE_DECAY_PER_SEC)) * dt
+                )
+
+                if self.brake_percent <= 0.0:
+                    self.decay_start_time = None
+
+                    # 已经发送过一次 0%，之后停止持续占用刹车轴。
+                    self.last_axis_value = None
+
+        self.prev_down = down
+
+
+# ============================================================
 # 主程序
 # ============================================================
 
@@ -502,6 +733,23 @@ def main():
     throttle_incr_small = Event(b"THROTTLE_INCR_SMALL", sm)
 
     throttle_decr_small = Event(b"THROTTLE_DECR_SMALL", sm)
+
+    # --------------------------------------------------------
+    # X 键渐进刹车事件
+    #
+    # 使用左右刹车轴 SET 事件，才能精确指定当前刹车强度。
+    # --------------------------------------------------------
+
+    x_brake = None
+
+    if ENABLE_X_BRAKE:
+        left_brake_set = Event(b"AXIS_LEFT_BRAKE_SET", sm)
+        right_brake_set = Event(b"AXIS_RIGHT_BRAKE_SET", sm)
+
+        x_brake = XBrakeController(
+            left_brake_set,
+            right_brake_set
+        )
 
     # --------------------------------------------------------
     # A = 加油门
@@ -550,6 +798,22 @@ def main():
         print("微调长按 = 不支持")
 
     print()
+
+    if ENABLE_X_BRAKE:
+        print("X：渐进刹车")
+        print(f"X 轻按：+{X_BRAKE_TAP_INCREASE:.1f}%")
+        print(
+            f"X 长按：+{X_BRAKE_HOLD_INCREASE_PER_SEC:.1f}%/秒 "
+            f"（按住 {_X_BRAKE_HOLD_DELAY:.2f}s 后开始连续增加）"
+        )
+        print(
+            f"X 松开：等待 {X_BRAKE_DECAY_DELAY:.2f}s 后，"
+            f"按 {X_BRAKE_DECAY_PER_SEC:.1f}%/秒衰减"
+        )
+    else:
+        print("X 渐进刹车功能：关闭")
+
+    print()
     print("Ctrl+C 退出")
 
 
@@ -583,6 +847,11 @@ def main():
                 a_button.cancel_until_release()
                 b_button.cancel_until_release()
 
+                # 手柄断开时立即释放本功能施加的刹车，
+                # 避免 X 在断开瞬间处于按下状态而导致刹车残留。
+                if x_brake is not None:
+                    x_brake.release_immediately()
+
                 time.sleep(0.25)
                 continue
 
@@ -601,6 +870,9 @@ def main():
 
             b_button.update(gamepad, now)
 
+            if x_brake is not None:
+                x_brake.update(gamepad, now)
+
             # ------------------------------------------------
             # 根据 POLL_HZ 设置扫描间隔
             # ------------------------------------------------
@@ -611,6 +883,10 @@ def main():
         print("\n程序退出。")
 
     finally:
+        # 退出程序时也确保不会留下本功能施加的刹车。
+        if x_brake is not None:
+            x_brake.release_immediately()
+
         sm.exit()
 
 
