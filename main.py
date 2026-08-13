@@ -528,6 +528,7 @@ class XBrakeController:
     X 键控制左右轮刹车。
 
     行为：
+      0. X 必须单独按下；LB+X、RB+X 都无效。
       1. 刚按下 X：立即增加 X_BRAKE_TAP_INCREASE。
       2. 按住超过 _X_BRAKE_HOLD_DELAY：按
          X_BRAKE_HOLD_INCREASE_PER_SEC 连续增加。
@@ -543,7 +544,18 @@ class XBrakeController:
         self.right_event = right_event
 
         self.brake_percent = 0.0
+
+        # 上一帧 X 的“有效按下”状态。
+        # 有效按下 = X 按着，并且本次 X 手势没有被 LB/RB 作废。
         self.prev_down = False
+
+        # 上一帧物理 X 是否按下，用来只在真正的 X 按下沿开始新手势。
+        self.prev_physical_down = False
+
+        # 当前这一次 X 手势是否有效。
+        # 如果 X 按下时带有 LB/RB，或按住 X 期间加入 LB/RB，
+        # 本次手势会一直作废，直到 X 完全松开后重新按。
+        self.active_gesture = False
 
         self.press_time = 0.0
         self.hold_started = False
@@ -588,6 +600,8 @@ class XBrakeController:
 
         self.brake_percent = 0.0
         self.prev_down = False
+        self.prev_physical_down = False
+        self.active_gesture = False
         self.press_time = 0.0
         self.hold_started = False
         self.decay_start_time = None
@@ -605,25 +619,57 @@ class XBrakeController:
         if not ENABLE_X_BRAKE:
             return
 
-        down = bool(gamepad.wButtons & XINPUT_GAMEPAD_X)
+        buttons = gamepad.wButtons
 
-        # ----------------------------------------------------
-        # 1. 新按下：立即按“轻按增加量”增加一次
-        # ----------------------------------------------------
-
-        if down and not self.prev_down:
-            self.press_time = now
-            self.hold_started = False
-            self.decay_start_time = None
-            self.last_update_time = now
-
-            self._set_brake_percent(
-                self.brake_percent
-                + max(0.0, float(X_BRAKE_TAP_INCREASE))
+        physical_down = bool(buttons & XINPUT_GAMEPAD_X)
+        shoulder_down = bool(
+            buttons
+            & (
+                XINPUT_GAMEPAD_LEFT_SHOULDER
+                | XINPUT_GAMEPAD_RIGHT_SHOULDER
             )
+        )
 
         # ----------------------------------------------------
-        # 2. 按住：超过长按判定后按“每秒增加量”连续增加
+        # 1. 只在“物理 X 刚按下”时决定本次手势是否合法
+        #
+        #    X       -> 有效
+        #    LB + X  -> 无效
+        #    RB + X  -> 无效
+        #    LB+RB+X -> 无效
+        #
+        # 无效后，即使先松开 LB/RB，只要 X 还没松开，
+        # 本次 X 都不会重新生效。
+        # ----------------------------------------------------
+
+        if physical_down and not self.prev_physical_down:
+            if shoulder_down:
+                self.active_gesture = False
+            else:
+                self.active_gesture = True
+                self.press_time = now
+                self.hold_started = False
+                self.decay_start_time = None
+                self.last_update_time = now
+
+                # 刚按下 X：立即增加一次刹车。
+                self._set_brake_percent(
+                    self.brake_percent
+                    + max(0.0, float(X_BRAKE_TAP_INCREASE))
+                )
+
+        # ----------------------------------------------------
+        # 2. X 按住过程中一旦加入 LB 或 RB，本次 X 立即作废
+        # ----------------------------------------------------
+
+        if physical_down and self.active_gesture and shoulder_down:
+            self.active_gesture = False
+
+        # 逻辑上的“有效 X 按下”。
+        down = physical_down and self.active_gesture
+
+        # ----------------------------------------------------
+        # 3. 按住：超过长按判定后按“每秒增加量”连续增加
         # ----------------------------------------------------
 
         if down:
@@ -648,7 +694,11 @@ class XBrakeController:
                 self.last_update_time = now
 
         # ----------------------------------------------------
-        # 3. 刚松开：记录衰减开始时间
+        # 4. 有效 X 刚结束：记录衰减开始时间
+        #
+        # 包括：
+        #   - 松开 X
+        #   - 按住 X 时加入 LB/RB，导致本次 X 被取消
         # ----------------------------------------------------
 
         if (not down) and self.prev_down:
@@ -659,7 +709,7 @@ class XBrakeController:
             self.last_update_time = now
 
         # ----------------------------------------------------
-        # 4. 松开后：延迟结束再连续衰减
+        # 5. 松开/作废后：延迟结束再连续衰减
         # ----------------------------------------------------
 
         if (
@@ -687,7 +737,12 @@ class XBrakeController:
                     # 已经发送过一次 0%，之后停止持续占用刹车轴。
                     self.last_axis_value = None
 
+        # X 完全松开后，本次手势结束；下一次按下才能重新判断。
+        if not physical_down:
+            self.active_gesture = False
+
         self.prev_down = down
+        self.prev_physical_down = physical_down
 
 
 # ============================================================
@@ -799,7 +854,7 @@ def main():
     print()
 
     if ENABLE_X_BRAKE:
-        print("X：渐进刹车")
+        print("X：渐进刹车（LB/RB + X 无效）")
         print(f"X 轻按：+{X_BRAKE_TAP_INCREASE:.1f}%")
         print(
             f"X 长按：+{X_BRAKE_HOLD_INCREASE_PER_SEC:.1f}%/秒 "
