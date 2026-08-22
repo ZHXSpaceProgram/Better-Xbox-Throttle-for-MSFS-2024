@@ -2,7 +2,7 @@
 
 ## 功能介绍
 
-- 基于 XInput + SimConnect 的轻量 Python 工具，可使用 Xbox 兼容手柄控制 Microsoft Flight Simulator 2024 油门。
+- 基于 XInput + SimConnect 的轻量 Python 工具，可使用 Xbox 手柄控制 Microsoft Flight Simulator 2024 油门。
 - 支持普通增减油门、LB 组合键微调以及长按连续变化，并可自动处理非法组合键和手柄断线重连。
 - 支持自定义短按次数、长按延迟、变化速率、微调模式等参数。
 
@@ -24,7 +24,6 @@
 
 - 可以通过配置文件 `config.ini` 调整控制参数，修改后重启程序生效。
 - 建议配合 [Input Viewer](https://github.com/spitice/msfs-input-viewer/releases) 插件使用。
-
 - 运行源码：
     ```
     pip install SimConnect
